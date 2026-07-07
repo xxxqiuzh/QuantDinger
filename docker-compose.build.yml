@@ -17,7 +17,7 @@ services:
     # discarding the user's local Vue edits.
     pull_policy: build
     build:
-      context: ${FRONTEND_SRC_PATH:-./QuantDinger-Vue}
+      context: ${FRONTEND_SRC_PATH:-../QuantDinger-Vue}
       dockerfile: Dockerfile
       args:
         APP_VERSION: ${APP_VERSION:-}
@@ -26,7 +26,7 @@ services:
   mobile:
     pull_policy: build
     build:
-      context: ${MOBILE_SRC_PATH:-./QuantDinger-Mobile}
+      context: ${MOBILE_SRC_PATH:-../QuantDinger-Mobile}
       dockerfile: Dockerfile
       args:
         APP_VERSION: ${APP_VERSION:-}
