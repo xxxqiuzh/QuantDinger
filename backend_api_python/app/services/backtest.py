@@ -880,6 +880,15 @@ class BacktestService:
                 mtf_requested=True,
                 mtf_active=True,
             )
+            result['qualityChecks'] = self._build_quality_checks(
+                metrics=metrics,
+                trades=trades,
+                strategy_config=strategy_config,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                indicator_code=indicator_code,
+            )
             self._attach_warmup_to_result(
                 result,
                 warmup_bars=warmup_bars,
@@ -1966,6 +1975,15 @@ class BacktestService:
         if exchange_id:
             ea['exchangeId'] = exchange_id
         result['executionAssumptions'] = ea
+        result['qualityChecks'] = self._build_quality_checks(
+            metrics=metrics,
+            trades=trades,
+            strategy_config=strategy_config,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            indicator_code=code,
+        )
         self._attach_buy_hold_benchmark(result, df, initial_capital, symbol)
         self._attach_actual_range_to_result(result, df)
         return result
@@ -2265,6 +2283,15 @@ class BacktestService:
             strategy_config,
             simulation_mode='standard',
             signal_timeframe=timeframe,
+        )
+        result['qualityChecks'] = self._build_quality_checks(
+            metrics=metrics,
+            trades=trades,
+            strategy_config=strategy_config,
+            commission=commission,
+            slippage=slippage,
+            leverage=leverage,
+            indicator_code=indicator_code,
         )
         if market_type:
             result['executionAssumptions']['marketType'] = market_type
@@ -4566,6 +4593,339 @@ class BacktestService:
         except Exception as e:
             logger.warning(f"Sharpe ratio calculation failed: {e}")
             return 0
+
+    def _build_quality_checks(
+        self,
+        *,
+        metrics: Optional[Dict[str, Any]],
+        trades: Optional[List[Dict[str, Any]]],
+        strategy_config: Optional[Dict[str, Any]],
+        commission: Optional[float],
+        slippage: Optional[float],
+        leverage: Optional[int] = None,
+        indicator_code: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build a human-facing checklist for whether a backtest is trustworthy."""
+        metrics = metrics or {}
+        trades = trades or []
+        cfg = strategy_config or {}
+        risk_cfg = cfg.get('risk') or {}
+        trailing_cfg = risk_cfg.get('trailing') or {}
+        checks: List[Dict[str, Any]] = []
+
+        def add(
+            check_id: str,
+            status: str,
+            severity: str,
+            title: str,
+            detail: str,
+            recommendation: str,
+            evidence: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            checks.append({
+                'id': check_id,
+                'status': status,
+                'severity': severity,
+                'title': title,
+                'detail': detail,
+                'recommendation': recommendation,
+                'evidence': evidence or {},
+            })
+
+        def as_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return default
+
+        commission_value = as_float(commission)
+        slippage_value = as_float(slippage)
+        total_trades = int(as_float(metrics.get('totalTrades'), 0))
+        max_drawdown = as_float(metrics.get('maxDrawdown'), 0.0)
+        win_rate = as_float(metrics.get('winRate'), 0.0)
+        profit_factor = as_float(metrics.get('profitFactor'), 0.0)
+        leverage_value = int(as_float(leverage, 1) or 1)
+        stop_loss_pct = as_float(risk_cfg.get('stopLossPct'))
+        take_profit_pct = as_float(risk_cfg.get('takeProfitPct'))
+        trailing_enabled = bool(trailing_cfg.get('enabled'))
+        trailing_pct = as_float(trailing_cfg.get('pct'))
+        trailing_activation_pct = as_float(trailing_cfg.get('activationPct'))
+
+        if commission_value > 0:
+            add(
+                'commission_configured',
+                'PASS',
+                'info',
+                '已扣手续费',
+                '本次回测已配置交易手续费。',
+                '继续按目标交易所的真实 taker/maker 费率校准。',
+                {'commission': commission_value},
+            )
+        else:
+            add(
+                'commission_configured',
+                'WARN',
+                'warn',
+                '未扣手续费',
+                '手续费为 0 会高估高频、网格和短周期策略收益。',
+                '请按目标交易所费率配置 commission 后重新回测。',
+                {'commission': commission_value},
+            )
+
+        if slippage_value > 0:
+            add(
+                'slippage_configured',
+                'PASS',
+                'info',
+                '已扣滑点',
+                '本次回测已配置滑点。',
+                '短周期或低流动性标的建议用更保守滑点做压力测试。',
+                {'slippage': slippage_value},
+            )
+        else:
+            add(
+                'slippage_configured',
+                'WARN',
+                'warn',
+                '未扣滑点',
+                '滑点为 0 会高估真实成交质量。',
+                '请配置 slippage，尤其是 1m/5m、网格和频繁交易策略。',
+                {'slippage': slippage_value},
+            )
+
+        if stop_loss_pct > 0:
+            add(
+                'stop_loss_configured',
+                'PASS',
+                'info',
+                '已配置硬止损',
+                '策略配置包含 stopLossPct，可作为价格级风险兜底。',
+                '确认 stopLossPct 是标的价格波动比例，不是账户收益率。',
+                {'stopLossPct': stop_loss_pct},
+            )
+        else:
+            add(
+                'stop_loss_configured',
+                'FAIL',
+                'fail',
+                '未配置硬止损',
+                '策略缺少 stopLossPct，遇到单边行情时风险不可控。',
+                '实盘前建议配置 stopLossPct，或明确由指标 close_* 承担止损职责。',
+                {'stopLossPct': stop_loss_pct},
+            )
+
+        if trailing_enabled and trailing_pct <= 0:
+            add(
+                'trailing_configured',
+                'FAIL',
+                'fail',
+                '追踪止盈配置不完整',
+                'trailingEnabled=true，但 trailingStopPct 未配置或为 0。',
+                '请配置 trailingStopPct，或关闭 trailingEnabled。',
+                {'trailingEnabled': trailing_enabled, 'trailingStopPct': trailing_pct},
+            )
+        elif trailing_enabled:
+            add(
+                'trailing_configured',
+                'PASS',
+                'info',
+                '追踪止盈已配置',
+                '策略启用了 trailing，并配置了 trailingStopPct。',
+                '确认 trailingActivationPct 与策略周期匹配，避免过窄触发。',
+                {
+                    'trailingEnabled': trailing_enabled,
+                    'trailingStopPct': trailing_pct,
+                    'trailingActivationPct': trailing_activation_pct,
+                },
+            )
+
+        if trailing_enabled and take_profit_pct > 0:
+            add(
+                'trailing_take_profit_semantics',
+                'WARN',
+                'warn',
+                '追踪止盈会优先于固定止盈',
+                '当前引擎规则下，trailingEnabled=true 时固定 takeProfitPct 不作为直接固定止盈触发。',
+                '如果希望到达 takeProfitPct 立刻止盈，请关闭 trailingEnabled；如果希望利润继续奔跑，请保留 trailing 并明确 activationPct。',
+                {'takeProfitPct': take_profit_pct, 'trailingEnabled': trailing_enabled},
+            )
+
+        if leverage_value >= 3 and stop_loss_pct >= 0.03:
+            add(
+                'leverage_stop_loss_width',
+                'WARN',
+                'warn',
+                '杠杆与止损宽度偏激进',
+                'stopLossPct 按标的价格波动触发，杠杆会放大账户盈亏。',
+                '如果目标是控制账户亏损，请按杠杆倍数缩小价格止损阈值，或降低 leverage。',
+                {'leverage': leverage_value, 'stopLossPct': stop_loss_pct},
+            )
+
+        if total_trades >= 30:
+            add(
+                'trade_sample_size',
+                'PASS',
+                'info',
+                '交易样本数量充足',
+                '交易次数达到基础统计观察门槛。',
+                '继续检查样本外和参数稳定性。',
+                {'totalTrades': total_trades},
+            )
+        elif total_trades >= 10:
+            add(
+                'trade_sample_size',
+                'WARN',
+                'warn',
+                '交易样本偏少',
+                '交易次数不足 30 笔，统计稳定性有限。',
+                '扩大回测区间或降低信号稀疏度后再评估。',
+                {'totalTrades': total_trades},
+            )
+        else:
+            add(
+                'trade_sample_size',
+                'WARN',
+                'warn',
+                '交易样本过少',
+                '交易次数不足 10 笔，收益和胜率缺少统计意义。',
+                '不要仅凭本次收益曲线进入实盘；先扩大样本。',
+                {'totalTrades': total_trades},
+            )
+
+        abs_drawdown = abs(max_drawdown)
+        if abs_drawdown >= 30:
+            status, severity, title = 'FAIL', 'fail', '最大回撤过高'
+            recommendation = '实盘前应降低仓位、收紧风险参数或增加停机规则。'
+        elif abs_drawdown >= 15:
+            status, severity, title = 'WARN', 'warn', '最大回撤偏高'
+            recommendation = '检查亏损集中区间，并评估是否需要 ATR 止损或最大回撤停机。'
+        else:
+            status, severity, title = 'PASS', 'info', '最大回撤处于可观察范围'
+            recommendation = '继续结合收益、夏普和样本外结果判断。'
+        add(
+            'max_drawdown',
+            status,
+            severity,
+            title,
+            f'本次回测最大回撤为 {round(max_drawdown, 4)}%。',
+            recommendation,
+            {'maxDrawdown': max_drawdown},
+        )
+
+        close_trades = [t for t in trades if str(t.get('type') or '').startswith('close') and t.get('profit') is not None]
+        if close_trades:
+            profits = [as_float(t.get('profit')) for t in close_trades]
+            total_profit = sum(profits)
+            best_profit = max(profits)
+            concentration = (best_profit / total_profit) if total_profit > 0 else 0
+            if concentration > 0.6:
+                add(
+                    'profit_concentration',
+                    'WARN',
+                    'warn',
+                    '收益集中在少数交易',
+                    '单笔最佳盈利占总盈利比例过高，策略可能依赖少数偶然行情。',
+                    '检查剔除最大盈利交易后的结果，避免高估稳定性。',
+                    {'bestProfit': round(best_profit, 6), 'totalProfit': round(total_profit, 6), 'concentration': round(concentration, 4)},
+                )
+            else:
+                add(
+                    'profit_concentration',
+                    'PASS',
+                    'info',
+                    '收益未明显集中',
+                    '未发现单笔盈利过度主导总收益。',
+                    '仍需结合样本外表现判断。',
+                    {'closeTrades': len(close_trades)},
+                )
+
+        if total_trades > 0:
+            if profit_factor < 1:
+                add(
+                    'win_rate_payoff_consistency',
+                    'WARN',
+                    'warn',
+                    '盈亏比不足',
+                    'profitFactor 小于 1，说明总盈利不足以覆盖总亏损。',
+                    '不要只看胜率；请检查平均盈利、平均亏损和止损设置。',
+                    {'winRate': win_rate, 'profitFactor': profit_factor},
+                )
+            elif win_rate >= 70 and profit_factor < 1.3:
+                add(
+                    'win_rate_payoff_consistency',
+                    'WARN',
+                    'warn',
+                    '高胜率但盈亏比一般',
+                    '胜率较高但 profitFactor 不高，可能依赖窄止盈宽止损。',
+                    '检查最大单笔亏损和尾部亏损，避免小赚大亏。',
+                    {'winRate': win_rate, 'profitFactor': profit_factor},
+                )
+            else:
+                add(
+                    'win_rate_payoff_consistency',
+                    'PASS',
+                    'info',
+                    '胜率和盈亏比未见明显冲突',
+                    '当前 winRate 与 profitFactor 没有触发基础风险提示。',
+                    '仍需结合交易样本量和样本外结果判断。',
+                    {'winRate': win_rate, 'profitFactor': profit_factor},
+                )
+
+        code = indicator_code or ''
+        suspicious_future = bool(re.search(r'\.shift\(\s*-\d+', code)) or bool(re.search(r'\.iloc\s*\[\s*i\s*\+', code))
+        if suspicious_future:
+            add(
+                'lookahead_bias_static_scan',
+                'WARN',
+                'warn',
+                '疑似未来函数写法',
+                '代码中出现负向 shift 或向后索引模式，可能引用未来 K 线。',
+                '请确认信号只使用当前及历史已知数据。',
+                {},
+            )
+        else:
+            add(
+                'lookahead_bias_static_scan',
+                'PASS',
+                'info',
+                '未发现常见未来函数写法',
+                '静态扫描未发现负向 shift 或明显向后索引。',
+                '该检查是启发式规则，不能替代人工代码审查。',
+                {},
+            )
+
+        edge_like = bool(re.search(r'shift\(\s*1\s*\)', code)) or 'edge(' in code
+        if code and not edge_like:
+            add(
+                'edge_trigger_static_scan',
+                'WARN',
+                'warn',
+                '未发现明显边缘触发',
+                '代码中未发现 shift(1) 或 edge() 模式，信号可能连续多根 K 线重复触发。',
+                '建议使用 raw_signal & ~raw_signal.shift(1).fillna(False) 生成交易信号。',
+                {},
+            )
+
+        add(
+            'parameter_stability',
+            'WARN',
+            'warn',
+            '参数稳定性未验证',
+            '当前回测结果未包含参数网格或稳定性热力图。',
+            '上线前建议检查合理参数区间，而不是只选择历史最优点。',
+            {},
+        )
+        add(
+            'sample_out_of_sample',
+            'WARN',
+            'warn',
+            '样本外验证未执行',
+            '当前回测结果未包含训练集/测试集切分或 Walk-Forward 结果。',
+            '进入实盘前建议至少做时间切分样本外验证。',
+            {},
+        )
+
+        return checks
     
     def _execution_assumptions(
         self,
@@ -4747,4 +5107,3 @@ class BacktestService:
             'equityCurve': cleaned_curve,
             'trades': cleaned_trades
         }
-
