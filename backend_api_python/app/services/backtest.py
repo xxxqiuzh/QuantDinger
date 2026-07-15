@@ -133,6 +133,46 @@ class BacktestService:
                 out[key] = value
         return out
 
+    def _slice_indicator_output_to_window(
+        self,
+        output: Dict[str, Any],
+        source_index: pd.Index,
+        target_index: pd.Index,
+    ) -> Dict[str, Any]:
+        if not isinstance(output, dict):
+            return {}
+
+        out = dict(output)
+        plots = output.get("plots")
+        if not isinstance(plots, list):
+            out["plots"] = []
+            return out
+
+        positions = source_index.get_indexer(target_index)
+        sliced_plots: List[Dict[str, Any]] = []
+        for plot in plots:
+            if not isinstance(plot, dict):
+                continue
+            data = plot.get("data")
+            if hasattr(data, "tolist"):
+                data = data.tolist()
+            if not isinstance(data, list):
+                continue
+
+            next_plot = dict(plot)
+            if len(data) == len(source_index) and all(pos >= 0 for pos in positions):
+                next_plot["data"] = [data[pos] for pos in positions]
+            elif len(data) == len(target_index):
+                next_plot["data"] = data
+            else:
+                # Keep the response contract strict for the frontend: every
+                # returned review plot must align one-to-one with review candles.
+                continue
+            sliced_plots.append(next_plot)
+
+        out["plots"] = sliced_plots
+        return out
+
     def _signal_diagnostics(self, signals: Dict[str, Any], trade_direction: str) -> Dict[str, Any]:
         """Return compact counts for explaining code signals vs execution signals."""
         def count_series(value: Any) -> int:
@@ -764,11 +804,21 @@ class BacktestService:
             'user_id': user_id,
             'indicator_id': indicator_id,
         }
-        signals_full = self._execute_indicator(indicator_code, df_signal_full, backtest_params)
+        signals_full, indicator_output_full = self._execute_indicator(
+            indicator_code,
+            df_signal_full,
+            backtest_params,
+            return_output=True,
+        )
         df_signal = self._slice_to_backtest_window(df_signal_full, start_date, end_date)
         if df_signal.empty:
             raise ValueError("No candle data available in the backtest date range")
         signals = self._slice_signals_to_window(signals_full, df_signal.index)
+        indicator_output = self._slice_indicator_output_to_window(
+            indicator_output_full,
+            df_signal_full.index,
+            df_signal.index,
+        )
         signal_diagnostics = self._signal_diagnostics(signals, trade_direction)
         logger.info(f"Signals generated: {list(signals.keys()) if isinstance(signals, dict) else type(signals)}")
         
@@ -863,6 +913,7 @@ class BacktestService:
         try:
             logger.info("Formatting backtest result...")
             result = self._format_result(metrics, equity_curve, trades)
+            result['plots'] = indicator_output.get('plots', [])
             result['signalDiagnostics'] = signal_diagnostics
             result['precision_info'] = precision_info
             result['execution_timeframe'] = exec_tf
@@ -2253,11 +2304,21 @@ class BacktestService:
             'user_id': user_id,
             'indicator_id': indicator_id,
         }
-        signals_full = self._execute_indicator(indicator_code, df_full, backtest_params)
+        signals_full, indicator_output_full = self._execute_indicator(
+            indicator_code,
+            df_full,
+            backtest_params,
+            return_output=True,
+        )
         df = self._slice_to_backtest_window(df_full, start_date, end_date)
         if df.empty:
             raise ValueError("No candle data available in the backtest date range")
         signals = self._slice_signals_to_window(signals_full, df.index)
+        indicator_output = self._slice_indicator_output_to_window(
+            indicator_output_full,
+            df_full.index,
+            df.index,
+        )
         signal_diagnostics = self._signal_diagnostics(signals, trade_direction)
         
         # 3. Simulate trading
@@ -2278,6 +2339,7 @@ class BacktestService:
         
         # 5. Format result
         result = self._format_result(metrics, equity_curve, trades)
+        result['plots'] = indicator_output.get('plots', [])
         result['signalDiagnostics'] = signal_diagnostics
         result['executionAssumptions'] = self._execution_assumptions(
             strategy_config,
@@ -2609,7 +2671,13 @@ class BacktestService:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
     
-    def _execute_indicator(self, code: str, df: pd.DataFrame, backtest_params: dict = None):
+    def _execute_indicator(
+        self,
+        code: str,
+        df: pd.DataFrame,
+        backtest_params: dict = None,
+        return_output: bool = False,
+    ):
         """Execute indicator code to get signals.
         
         Args:
@@ -2746,6 +2814,8 @@ class BacktestService:
             logger.error(traceback.format_exc())
             raise
         
+        if return_output:
+            return signals, output_obj if isinstance(output_obj, dict) else {}
         return signals
 
     def _execute_script_strategy(self, code: str, df: pd.DataFrame, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

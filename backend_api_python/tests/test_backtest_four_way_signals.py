@@ -57,6 +57,129 @@ def test_execute_indicator_four_way_with_output_signals_no_buy_sell():
     assert bool(out["close_long"].iloc[10])
 
 
+def test_execute_indicator_can_return_chart_output_plots():
+    svc = BacktestService()
+    df = _sample_df()
+    code = """
+df = df.copy()
+df['open_long'] = False
+df['close_long'] = False
+df['open_short'] = False
+df['close_short'] = False
+output = {
+    'name': 'Plot Test',
+    'plots': [
+        {'name': 'Close', 'data': df['close'].tolist(), 'color': '#fff', 'overlay': True},
+    ],
+    'signals': [],
+}
+"""
+
+    signals, output = svc._execute_indicator(code, df, backtest_params={}, return_output=True)
+
+    assert "open_long" in signals
+    assert output["name"] == "Plot Test"
+    assert output["plots"][0]["name"] == "Close"
+    assert output["plots"][0]["data"] == df["close"].tolist()
+
+
+def test_run_result_includes_sliced_chart_output_plots(monkeypatch):
+    svc = BacktestService()
+    df = _sample_df(20)
+    start = df.index[5]
+    end = df.index[14]
+    code = """
+df = df.copy()
+df['open_long'] = False
+df['close_long'] = False
+df['open_short'] = False
+df['close_short'] = False
+output = {
+    'name': 'Plot Test',
+    'plots': [
+        {'name': 'Close', 'data': df['close'].tolist(), 'color': '#fff', 'overlay': True},
+    ],
+    'signals': [],
+}
+"""
+
+    monkeypatch.setattr(svc, "_fetch_kline_data", lambda *args, **kwargs: df)
+    monkeypatch.setattr(
+        svc,
+        "_simulate_trading",
+        lambda df_window, *args, **kwargs: ([{"time": str(df_window.index[0]), "value": 10000.0}], [], 0.0),
+    )
+    monkeypatch.setattr(
+        svc,
+        "_calculate_metrics",
+        lambda *args, **kwargs: {"totalReturn": 0.0, "totalTrades": 0, "maxDrawdown": 0.0},
+    )
+    monkeypatch.setattr(svc, "_build_quality_checks", lambda **kwargs: [])
+
+    result = svc.run(
+        indicator_code=code,
+        market="crypto",
+        symbol="BTC/USDT",
+        timeframe="5m",
+        start_date=start,
+        end_date=end,
+    )
+
+    assert result["plots"][0]["name"] == "Close"
+    assert result["plots"][0]["data"] == df.loc[start:end, "close"].tolist()
+
+
+def test_run_multi_timeframe_result_includes_sliced_chart_output_plots(monkeypatch):
+    svc = BacktestService()
+    df = _sample_df(20)
+    start = df.index[5]
+    end = df.index[14]
+    code = """
+df = df.copy()
+df['open_long'] = False
+df['close_long'] = False
+df['open_short'] = False
+df['close_short'] = False
+output = {
+    'name': 'Plot Test',
+    'plots': [
+        {'name': 'Close', 'data': df['close'].tolist(), 'color': '#fff', 'overlay': True},
+    ],
+    'signals': [],
+}
+"""
+
+    monkeypatch.setattr(
+        svc,
+        "get_execution_timeframe",
+        lambda *args, **kwargs: ("1m", {"enabled": True, "timeframe": "1m"}),
+    )
+    monkeypatch.setattr(svc, "_fetch_kline_data", lambda *args, **kwargs: df)
+    monkeypatch.setattr(
+        svc,
+        "_simulate_trading_mtf",
+        lambda **kwargs: ([{"time": str(kwargs["df_signal"].index[0]), "value": 10000.0}], [], 0.0),
+    )
+    monkeypatch.setattr(
+        svc,
+        "_calculate_metrics",
+        lambda *args, **kwargs: {"totalReturn": 0.0, "totalTrades": 0, "maxDrawdown": 0.0},
+    )
+
+    result = svc.run_multi_timeframe(
+        indicator_code=code,
+        market="crypto",
+        symbol="BTC/USDT",
+        timeframe="5m",
+        start_date=start,
+        end_date=end,
+        strategy_config={"execution": {"signalTiming": "next_bar_open"}},
+    )
+
+    assert result["plots"][0]["name"] == "Close"
+    assert result["plots"][0]["data"] == df.loc[start:end, "close"].tolist()
+
+
 def test_builtin_indicator_sample_executes_with_four_way_contract():
     svc = BacktestService()
     df = _sample_df(120)
